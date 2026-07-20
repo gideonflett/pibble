@@ -79,6 +79,55 @@ cd pibble
 | `Ctrl+S` | Open settings |
 | `Escape` | Close the launcher |
 
+## Plugins
+
+Every subdirectory of `~/.config/pibble/plugins/` that contains a `page.qml` is loaded as an extra launcher page. Plugin pages join the Tab cycle and appear in Settings → Pages as a chip (click to enable/disable, drag to reorder), exactly like the built-in pages. The leftmost enabled chip is the page the launcher opens on.
+
+> [!CAUTION]
+> Plugins are ordinary QML: they can import Quickshell and spawn processes with your user's permissions. Install only plugins you trust.
+
+The root item of `page.qml` is instantiated once at daemon startup, resized to the full launcher area, and shown while its page is active.
+
+Required:
+
+| Property | Meaning |
+|---|---|
+| `property string pluginId` | Unique page id. Must not be `clock`, `apps`, `walls`, `clips`, or `settings`, or collide with another plugin — rejected plugins surface as a notification. |
+
+Optional, read by the launcher:
+
+| Member | Meaning |
+|---|---|
+| `property string title` | Display name (defaults to the pluginId) |
+| `function nav(dx, dy)` | Called for arrow keys / scroll wheel while the page is active (`dx`/`dy` are -1, 0, or 1) |
+| `function activate()` | Called for the launch keybind (Enter) |
+| `property string searchText` | If declared, receives what the user types while the page is active; if absent, typing jumps to the app search like on the clock page |
+
+Injected by the launcher after load — declare it to receive the shell API:
+
+| Member | Meaning |
+|---|---|
+| `property var shell` | Object with `accent`, `fg`, `muted`, `surface` (colors), `fontFamily`, `fontScale`, `activePane`, `launcherShown`, `close()`, `animMs(ms)` |
+
+Escape, Tab/cycle, settings, and power keybinds stay with the launcher. A minimal plugin:
+
+```qml
+// ~/.config/pibble/plugins/hello/page.qml
+import QtQuick
+
+Item {
+    readonly property string pluginId: "hello"
+    property var shell: null
+
+    Text {
+        anchors.centerIn: parent
+        text: "hello from a plugin"
+        color: shell ? shell.fg : "white"
+        font { family: shell ? shell.fontFamily : ""; pixelSize: 24 }
+    }
+}
+```
+
 ## Namespaces
 
 Each window has a layer-shell namespace which can be used to apply background effects in your compositor's configuration file.

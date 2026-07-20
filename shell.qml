@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Effects
+import Qt.labs.folderlistmodel
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
@@ -626,6 +627,21 @@ ShellRoot {
     }
     function saveSettings() {
         settingsStore.writeAdapter();
+    }
+
+    // ---------- plugins ----------
+    // Every subdirectory of ~/.config/pibble/plugins that contains a
+    // page.qml is loaded as an extra launcher pane; see the Plugins section
+    // of the README for the page contract. Panes register into
+    // win.pluginPanes as their Loaders finish and join the Tab cycle and
+    // the settings Pages chips from there.
+    readonly property string pluginDir: (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")) + "/pibble/plugins"
+    FolderListModel {
+        id: pluginFolders
+        folder: "file://" + root.pluginDir
+        showDirs: true
+        showFiles: false
+        showDotAndDotDot: false
     }
 
     // ---------- theme ----------
@@ -1400,14 +1416,69 @@ ShellRoot {
             height: win.revH
         }
 
+        // ---------- plugin panes ----------
+        // Plugin pages register here as their Loaders finish; each entry is
+        // { id, title, item, loader }. Registered panes join the Tab cycle
+        // and the settings Pages chips exactly like the built-in four.
+        property var pluginPanes: []
+        function pluginFor(id) {
+            return pluginPanes.find(p => p.id === id) ?? null;
+        }
+        // a pane is shown only by the loader that owns its registration, so
+        // a rejected duplicate id can't shadow the plugin that won it
+        function pluginShown(loader): bool {
+            const p = pluginPanes.find(x => x.loader === loader);
+            return !!p && pane === p.id;
+        }
+        function registerPlugin(loader) {
+            const item = loader.item;
+            if (!item)
+                return;
+            const id = ("" + (item.pluginId ?? "")).trim();
+            const src = ("" + loader.source).replace("file://", "");
+            if (!id) {
+                root.notifyError("Plugin rejected", src + " has no pluginId");
+                return;
+            }
+            if (["clock", "apps", "walls", "clips", "settings"].includes(id) || pluginPanes.some(p => p.id === id)) {
+                root.notifyError("Plugin rejected", src + " reuses the pane id '" + id + "'");
+                return;
+            }
+            if ("shell" in item)
+                item.shell = win.pluginApi;
+            pluginPanes = pluginPanes.concat([{ id: id, title: "" + (item.title ?? id), item: item, loader: loader }]);
+        }
+        function unregisterPlugin(loader) {
+            if (pluginPanes.some(p => p.loader === loader))
+                pluginPanes = pluginPanes.filter(p => p.loader !== loader);
+        }
+        // the surface a plugin page may touch, kept deliberately small so
+        // pages stay portable across pibble versions
+        readonly property QtObject pluginApi: QtObject {
+            readonly property color accent: root.accent
+            readonly property color fg: root.fg
+            readonly property color muted: root.muted
+            readonly property color surface: root.surface
+            readonly property string fontFamily: root.mono
+            readonly property real fontScale: cfg.fontScale
+            readonly property string activePane: win.pane
+            readonly property bool launcherShown: win.shown
+            function close() {
+                win.exit();
+            }
+            function animMs(ms: int): int {
+                return win.ad(ms);
+            }
+        }
+
         // ---------- pane state ----------
         // Tab cycles the enabled panes; the settings pane sits outside the
         // cycle (opened via the corner button or Ctrl+S).
         property string pane: "clock"
         // cycle order comes from settings (drag the page chips to reorder);
-        // healed so all four pages are always present exactly once
+        // healed so all built-in and plugin pages are always present exactly once
         readonly property var paneOrder: {
-            const def = ["clock", "apps", "walls", "clips"];
+            const def = ["clock", "apps", "walls", "clips"].concat(pluginPanes.map(p => p.id));
             // pageOrder read back from settings.json is a QVariantList
             // wrapper: array-like but not a JS Array, so gating on
             // Array.isArray discarded every saved order on restart
@@ -1674,6 +1745,10 @@ ShellRoot {
                     : hMove(clipSelected, clipMatches.length, dx);
                 pageStagger(clipPageSize, clipSelected, next);
                 clipSelected = next;
+            } else {
+                const p = pluginFor(pane);
+                if (p && typeof p.item.nav === "function")
+                    p.item.nav(dx, dy);
             }
         }
         // Arm the tile stagger when a navigation moves between pages (guarding
@@ -1896,6 +1971,11 @@ ShellRoot {
                 launch(matches.length ? matches[selected] : null);
             else if (pane === "clock")
                 setPane("apps");
+            else {
+                const p = pluginFor(pane);
+                if (p && typeof p.item.activate === "function")
+                    p.item.activate();
+            }
         }
 
         // ---------- keybinds ----------
@@ -3049,6 +3129,42 @@ ShellRoot {
                 }
             }
 
+            // Plugin panes: one Loader per plugin directory, loaded eagerly
+            // at startup so every pane is registered (and in the Tab cycle)
+            // before it is first shown.
+            Repeater {
+                model: pluginFolders
+
+                Item {
+                    id: pluginSlot
+                    required property string filePath
+                    anchors.fill: parent
+                    transform: panePull
+                    visible: win.pluginShown(pluginLoader)
+                    onVisibleChanged: if (visible) pluginIn.restart()
+                    NumberAnimation {
+                        id: pluginIn
+                        target: pluginSlot
+                        property: "opacity"
+                        from: 0
+                        to: 1
+                        duration: win.ad(200)
+                        easing.type: Easing.OutCubic
+                    }
+                    Loader {
+                        id: pluginLoader
+                        anchors.fill: parent
+                        source: "file://" + pluginSlot.filePath + "/page.qml"
+                        onLoaded: win.registerPlugin(pluginLoader)
+                        onStatusChanged: {
+                            if (status === Loader.Error)
+                                root.notifyError("Plugin failed to load", pluginSlot.filePath);
+                        }
+                    }
+                    Component.onDestruction: win.unregisterPlugin(pluginLoader)
+                }
+            }
+
             // Settings pane
             Item {
                 id: settingsPane
@@ -3416,12 +3532,17 @@ ShellRoot {
                             anchors.right: parent.right
                             anchors.rightMargin: 34
                             anchors.verticalCenter: parent.verticalCenter
-                            readonly property int slotW: 100
-                            width: slotW * 4 - 8
+                            // stable chip list: built-ins plus plugins in
+                            // discovery order (positions come from paneOrder,
+                            // so a reorder must not rebuild the delegates)
+                            readonly property var chipModel: ["clock", "apps", "walls", "clips"].concat(win.pluginPanes.map(p => p.id))
+                            // chips shrink once plugins outgrow the row
+                            readonly property int slotW: Math.min(100, Math.floor(620 / Math.max(1, chipModel.length)))
+                            width: slotW * chipModel.length - 8
                             height: 28
 
                             Repeater {
-                                model: ["clock", "apps", "walls", "clips"]
+                                model: pagesArea.chipModel
 
                                 Item {
                                     id: pageChip
@@ -3476,7 +3597,9 @@ ShellRoot {
                                         anchors.verticalCenter: parent.verticalCenter
                                         anchors.left: pageBox.right
                                         anchors.leftMargin: 6
+                                        anchors.right: parent.right
                                         text: pageChip.modelData
+                                        elide: Text.ElideRight
                                         color: pageChip.on ? root.fg : root.muted
                                         font { family: root.mono; pixelSize: root.fs(12) }
                                     }
@@ -3502,7 +3625,7 @@ ShellRoot {
                                             if (!active)
                                                 return;
                                             pageChip.dragOff = centroid.scenePosition.x - pageChip.grabDX - pageChip.slotX;
-                                            const idx = Math.max(0, Math.min(3, Math.round(pageChip.x / pagesArea.slotW)));
+                                            const idx = Math.max(0, Math.min(pagesArea.chipModel.length - 1, Math.round(pageChip.x / pagesArea.slotW)));
                                             if (idx !== pageChip.ord) {
                                                 win.movePage(pageChip.modelData, idx);
                                                 // slotX just jumped to the new ord (its Behavior
@@ -4139,9 +4262,16 @@ ShellRoot {
             opacity: 0
             focus: true
 
-            // typing from the clock jumps straight into the app search
+            // typing from the clock jumps straight into the app search; a
+            // plugin pane that declares searchText receives the typing
+            // instead, and one that doesn't behaves like the clock
             onTextChanged: {
-                if (text.length > 0 && win.pane === "clock" && win.activePanes.includes("apps"))
+                const p = win.pluginFor(win.pane);
+                if (p && ("searchText" in p.item)) {
+                    p.item.searchText = text;
+                    return;
+                }
+                if (text.length > 0 && (win.pane === "clock" || p) && win.activePanes.includes("apps"))
                     win.pane = "apps";
             }
 
