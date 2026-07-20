@@ -83,10 +83,12 @@ cd pibble
 
 Every subdirectory of `~/.config/pibble/plugins/` that contains a `page.qml` is loaded as an extra launcher page. Plugin pages join the Tab cycle and appear in Settings → Pages as a chip (click to enable/disable, drag to reorder), exactly like the built-in pages. The leftmost enabled chip is the page the launcher opens on.
 
-> [!CAUTION]
-> Plugins are ordinary QML: they can import Quickshell and spawn processes with your user's permissions. Install only plugins you trust.
+The Plugins settings tab lists every plugin folder with its load state (which page it loaded as, or why it was rejected). Unticking a plugin there fully unloads it — its QML is not instantiated at all until it is ticked back on — and its page leaves the cycle and the Pages row. New folders are picked up live, no restart needed.
 
-The root item of `page.qml` is instantiated once at daemon startup, resized to the full launcher area, and shown while its page is active.
+> [!CAUTION]
+> Plugins are ordinary QML: they can import Quickshell and spawn processes with your user's permissions. Install only plugins you trust; keep unvetted ones unticked in the Plugins settings tab, which stops them from running at all.
+
+The root item of `page.qml` is instantiated once at daemon startup (unless switched off), resized to the full launcher area, and shown while its page is active.
 
 Required:
 

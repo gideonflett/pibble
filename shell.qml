@@ -573,6 +573,9 @@ ShellRoot {
             property var pages: ({ clock: true, apps: true, walls: true, clips: true })
             // cycle order of the pages (drag the chips in settings to change)
             property var pageOrder: ["clock", "apps", "walls", "clips"]
+            // plugin folders (by directory name) switched off in settings;
+            // their QML is never instantiated, not merely hidden
+            property var pluginsOff: []
             property string animStyle: "wave"
             // shared across the launcher and both flyouts
             property real fontScale: 1.0
@@ -727,6 +730,13 @@ ShellRoot {
 
     function fs(px: int): int {
         return Math.round(px * cfg.fontScale);
+    }
+
+    // JSON-loaded lists surface as QVariantList wrappers: array-like
+    // (length + indices) but Array.isArray-false, so list-valued settings
+    // must pass through here before any Array method is used on them
+    function asList(v) {
+        return v && typeof v === "object" && v.length !== undefined ? Array.from(v) : null;
     }
 
     // internal errors surface as regular notifications (we are the server)
@@ -1418,7 +1428,7 @@ ShellRoot {
 
         // ---------- plugin panes ----------
         // Plugin pages register here as their Loaders finish; each entry is
-        // { id, title, item, loader }. Registered panes join the Tab cycle
+        // { id, title, dir, item, loader }. Registered panes join the Tab cycle
         // and the settings Pages chips exactly like the built-in four.
         property var pluginPanes: []
         function pluginFor(id) {
@@ -1430,23 +1440,59 @@ ShellRoot {
             const p = pluginPanes.find(x => x.loader === loader);
             return !!p && pane === p.id;
         }
+        // load problems by plugin directory name; notifications alone
+        // vanish, this stays inspectable in the settings Plugins rows
+        property var pluginIssues: ({})
+        function setPluginIssue(dir: string, msg: string) {
+            const m = Object.assign({}, pluginIssues);
+            m[dir] = msg;
+            pluginIssues = m;
+        }
+        function clearPluginIssue(dir: string) {
+            if (!(dir in pluginIssues))
+                return;
+            const m = Object.assign({}, pluginIssues);
+            delete m[dir];
+            pluginIssues = m;
+        }
+        function pluginOff(dir: string): bool {
+            return (root.asList(cfg.pluginsOff) ?? []).includes(dir);
+        }
+        function togglePlugin(dir: string) {
+            const off = root.asList(cfg.pluginsOff) ?? [];
+            cfg.pluginsOff = off.includes(dir) ? off.filter(d => d !== dir) : off.concat([dir]);
+            root.saveSettings();
+        }
+        // one-line load state for a settings Plugins row
+        function pluginState(dir: string): string {
+            if (pluginOff(dir))
+                return "off";
+            const p = pluginPanes.find(p => p.dir === dir);
+            if (p)
+                return "loaded as page '" + p.id + "'";
+            return pluginIssues[dir] ?? "loading…";
+        }
         function registerPlugin(loader) {
             const item = loader.item;
             if (!item)
                 return;
             const id = ("" + (item.pluginId ?? "")).trim();
             const src = ("" + loader.source).replace("file://", "");
+            const dir = src.split("/").slice(-2)[0];
             if (!id) {
+                setPluginIssue(dir, "rejected: page.qml declares no pluginId");
                 root.notifyError("Plugin rejected", src + " has no pluginId");
                 return;
             }
             if (["clock", "apps", "walls", "clips", "settings"].includes(id) || pluginPanes.some(p => p.id === id)) {
+                setPluginIssue(dir, "rejected: pane id '" + id + "' is taken");
                 root.notifyError("Plugin rejected", src + " reuses the pane id '" + id + "'");
                 return;
             }
+            clearPluginIssue(dir);
             if ("shell" in item)
                 item.shell = win.pluginApi;
-            pluginPanes = pluginPanes.concat([{ id: id, title: "" + (item.title ?? id), item: item, loader: loader }]);
+            pluginPanes = pluginPanes.concat([{ id: id, title: "" + (item.title ?? id), dir: dir, item: item, loader: loader }]);
         }
         function unregisterPlugin(loader) {
             if (pluginPanes.some(p => p.loader === loader))
@@ -1601,7 +1647,7 @@ ShellRoot {
         function cyclePane(dir: int) {
             // inside settings the cycle keybinds walk the settings tabs
             if (pane === "settings") {
-                const tabs = ["general", "launcher", "flyouts"];
+                const tabs = ["general", "launcher", "flyouts", "plugins"];
                 settingsTab = tabs[((tabs.indexOf(settingsTab) + dir) % tabs.length + tabs.length) % tabs.length];
                 return;
             }
@@ -3138,6 +3184,7 @@ ShellRoot {
                 Item {
                     id: pluginSlot
                     required property string filePath
+                    required property string fileName
                     anchors.fill: parent
                     transform: panePull
                     visible: win.pluginShown(pluginLoader)
@@ -3154,11 +3201,17 @@ ShellRoot {
                     Loader {
                         id: pluginLoader
                         anchors.fill: parent
+                        // a switched-off plugin is not just hidden: its QML
+                        // is never instantiated, so nothing of it runs
+                        active: !win.pluginOff(pluginSlot.fileName)
+                        onActiveChanged: if (!active) win.unregisterPlugin(pluginLoader)
                         source: "file://" + pluginSlot.filePath + "/page.qml"
                         onLoaded: win.registerPlugin(pluginLoader)
                         onStatusChanged: {
-                            if (status === Loader.Error)
+                            if (status === Loader.Error) {
+                                win.setPluginIssue(pluginSlot.fileName, "page.qml missing or broken — check the log");
                                 root.notifyError("Plugin failed to load", pluginSlot.filePath);
+                            }
                         }
                     }
                     Component.onDestruction: win.unregisterPlugin(pluginLoader)
@@ -3168,7 +3221,7 @@ ShellRoot {
             // Settings pane
             Item {
                 id: settingsPane
-                readonly property var tabOrder: ["general", "launcher", "flyouts"]
+                readonly property var tabOrder: ["general", "launcher", "flyouts", "plugins"]
                 readonly property int tabIdx: Math.max(0, tabOrder.indexOf(win.settingsTab))
                 anchors.centerIn: parent
                 width: 860
@@ -3212,7 +3265,8 @@ ShellRoot {
                             model: [
                                 { id: "general", label: "General" },
                                 { id: "launcher", label: "Launcher" },
-                                { id: "flyouts", label: "Flyouts" }
+                                { id: "flyouts", label: "Flyouts" },
+                                { id: "plugins", label: "Plugins" }
                             ]
 
                             Item {
@@ -3259,7 +3313,118 @@ ShellRoot {
                     anchors.topMargin: 18
                     // constant height (tallest page): switching tabs never
                     // moves the pane, shorter pages stay top-aligned
-                    height: Math.max(genCol.height, settingsCol.height, flyCol.height)
+                    height: Math.max(genCol.height, settingsCol.height, flyCol.height, plugCol.height)
+
+                // plugins tab: one row per folder under the plugins
+                // directory — tick to load/unload live, with the load
+                // state (or why loading failed) alongside
+                Column {
+                    id: plugCol
+                    x: 20 + (3 - settingsPane.tabIdx) * 840
+                    Behavior on x {
+                        NumberAnimation { duration: win.ad(420); easing.type: Easing.OutCubic }
+                    }
+                    spacing: 14
+
+                    Item {
+                        width: 780
+                        height: 34 + pluginList.height + 2 + pluginsSub.implicitHeight
+
+                        Item {
+                            id: pluginsMain
+                            width: parent.width
+                            height: 34
+
+                            SLabel {
+                                anchors.left: parent.left
+                                text: "Installed"
+                            }
+                            SReset {
+                                key: "plugins"
+                                anchors.right: parent.right
+                            }
+                        }
+
+                        Column {
+                            id: pluginList
+                            anchors.top: pluginsMain.bottom
+                            anchors.left: parent.left
+                            anchors.leftMargin: 18
+                            anchors.right: parent.right
+                            anchors.rightMargin: 34
+                            spacing: 2
+
+                            SSub {
+                                visible: pluginFolders.count === 0
+                                text: "none found in " + root.pluginDir
+                            }
+
+                            Repeater {
+                                model: pluginFolders
+
+                                Item {
+                                    id: pluginRow
+                                    required property string fileName
+                                    readonly property bool on: !win.pluginOff(fileName)
+                                    readonly property bool trouble: on && (fileName in win.pluginIssues)
+                                    width: pluginList.width
+                                    height: 30
+
+                                    Rectangle {
+                                        id: pluginBox
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 18
+                                        height: 18
+                                        radius: 4
+                                        color: pluginRow.on ? Qt.alpha(root.accent, 0.85) : "transparent"
+                                        border.width: 1
+                                        border.color: pluginRow.on ? root.accent : Qt.alpha(root.muted, 0.6)
+
+                                        Text {
+                                            anchors.centerIn: parent
+                                            visible: pluginRow.on
+                                            text: root.ti.check
+                                            color: "#141210"
+                                            font { family: root.tablerFont; pixelSize: 13 }
+                                        }
+                                    }
+                                    Text {
+                                        id: pluginName
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        anchors.left: pluginBox.right
+                                        anchors.leftMargin: 8
+                                        width: Math.min(implicitWidth, 220)
+                                        elide: Text.ElideRight
+                                        text: pluginRow.fileName
+                                        color: pluginRow.on ? root.fg : root.muted
+                                        font { family: root.mono; pixelSize: root.fs(13) }
+                                    }
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        anchors.left: pluginName.right
+                                        anchors.leftMargin: 14
+                                        anchors.right: parent.right
+                                        horizontalAlignment: Text.AlignRight
+                                        elide: Text.ElideRight
+                                        text: win.pluginState(pluginRow.fileName)
+                                        color: pluginRow.trouble ? root.fg : Qt.alpha(root.muted, 0.85)
+                                        font { family: root.mono; pixelSize: root.fs(12) }
+                                    }
+                                    TapHandler {
+                                        onTapped: win.togglePlugin(pluginRow.fileName)
+                                    }
+                                }
+                            }
+                        }
+
+                        SSub {
+                            id: pluginsSub
+                            anchors.top: pluginList.bottom
+                            anchors.topMargin: 2
+                            text: "folders load from " + root.pluginDir.replace(Quickshell.env("HOME"), "~") + " — switched-off plugins are fully unloaded"
+                        }
+                    }
+                }
 
                 // general tab: settings shared by the launcher and both flyouts
                 Column {
@@ -4208,6 +4373,7 @@ ShellRoot {
             case "clock":
                 cfg.clockShow = ({ date: true, battery: true, weather: true });
                 break;
+            case "plugins": cfg.pluginsOff = []; break;
             case "appsGrid": cfg.appsCols = 4; cfg.appsRows = 3; break;
             case "wallsGrid": cfg.wallsCols = 3; cfg.wallsRows = 3; break;
             case "clipsGrid": cfg.clipsCols = 4; cfg.clipsRows = 4; break;
